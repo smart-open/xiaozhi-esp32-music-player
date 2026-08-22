@@ -5,8 +5,15 @@
 #define TAG "Mp3Player_HTTP"
 
 #pragma region HTTP 全域變數
-const static std::string base_url = CONFIG_SUBSONICAPI_URL;
+// Subsonic 伺服器位址：預設為燒錄值，play_url 執行時可由播放 URL 動態推導覆蓋（免燒錄、自動適配位址變化）
+static std::string base_url = CONFIG_SUBSONICAPI_URL;
 const static std::string subsonic_api_para = CONFIG_SUBSONICAPI_PARA; //"u=admin&p=1111&s=raw&v=1.16.1&c=xiaozhi";
+
+void Mp3Player::SetSubsonicBaseUrl(const std::string& url){
+    if(!url.empty()){
+        base_url = url;
+    }
+}
 
 /**
  * @brief deserializeJson 時使用此類物件，並搭配 filter 時，可實現串流解析 JSON 並大幅縮小 Subsonic API 的 JSON 體積 
@@ -42,6 +49,70 @@ private:
     int _pos;
     int _len;
 };
+
+// URL 解码（%XX 十六进制与 '+' 转空格）
+static std::string url_decode(const std::string &str)
+{
+    std::string decoded;
+    char hex[3] = {0};
+    for (size_t i = 0; i < str.length(); i++)
+    {
+        if (str[i] == '%' && i + 2 < str.length() &&
+            isxdigit((unsigned char)str[i + 1]) && isxdigit((unsigned char)str[i + 2]))
+        {
+            hex[0] = str[i + 1];
+            hex[1] = str[i + 2];
+            decoded += (char)strtol(hex, nullptr, 16);
+            i += 2;
+        }
+        else if (str[i] == '+')
+        {
+            decoded += ' ';
+        }
+        else
+        {
+            decoded += str[i];
+        }
+    }
+    return decoded;
+}
+
+bool Mp3Player::ParseStreamUrl(const std::string& url, std::string& base, std::string& song_id){
+    /* 從 Subsonic stream URL 解析伺服器位址與歌曲 id
+       例：http://192.168.31.116:8000/subsonic/rest/stream.view?u=admin&p=...&id=xxx.mp3
+       -> base = http://192.168.31.116:8000/subsonic/rest
+       -> song_id = xxx.mp3（URL 解碼後的檔名） */
+    size_t qmark = url.find('?');
+    if (qmark == std::string::npos || qmark == 0) {
+        return false;
+    }
+    std::string path = url.substr(0, qmark);
+    size_t slash = path.rfind('/');
+    if (slash == std::string::npos) {
+        return false;
+    }
+    std::string endpoint = path.substr(slash + 1);
+    if (endpoint != "stream.view" && endpoint != "stream") {
+        return false;
+    }
+    base = path.substr(0, slash);
+
+    // 在查詢字串中找 id 參數
+    std::string query = url.substr(qmark + 1);
+    size_t pos = 0;
+    while (pos < query.length()) {
+        size_t amp = query.find('&', pos);
+        std::string kv = query.substr(pos, (amp == std::string::npos ? query.length() : amp) - pos);
+        size_t eq = kv.find('=');
+        if (eq != std::string::npos && kv.substr(0, eq) == "id") {
+            song_id = url_decode(kv.substr(eq + 1));
+            return !song_id.empty();
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return false;
+}
 
 // URL编码函数
 static std::string url_encode(const std::string &str)
@@ -105,7 +176,8 @@ bool get_subsonic_response(std::string& full_url, JsonDocument &response)
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
 
-    http->SetTimeout(1500);
+    // 低功耗 WiFi 下接收延迟可达数秒，1.5s 会误判超时
+    http->SetTimeout(10000);
 
     // 開啟 HTTP
     if (!http->Open("GET", full_url))
@@ -323,7 +395,7 @@ bool Mp3Player::get_cover_by_coverid_http(const std::string& cover_id, uint8_t**
 #endif
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
-    http->SetTimeout(1500);
+    http->SetTimeout(10000);
 
     std::string cover_url = build_cover_url(cover_id);
     ESP_LOGI(TAG, "封面 URL: %s", cover_url.c_str());

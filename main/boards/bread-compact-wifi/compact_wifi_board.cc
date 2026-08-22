@@ -9,6 +9,7 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
+#include "mp3_player.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -31,6 +32,7 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    Mp3Player* music_player_ = nullptr;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -150,6 +152,8 @@ private:
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
+        // 音乐播放器（面包板功放为单声道，不开启立体声）
+        music_player_ = new Mp3Player();
     }
 
 public:
@@ -182,6 +186,10 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+
+    virtual Mp3Player* GetMusicPlayer() override {
+        return music_player_;
     }
 };
 

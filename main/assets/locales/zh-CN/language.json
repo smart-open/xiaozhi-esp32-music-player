@@ -57,6 +57,7 @@
         "FLIGHT_MODE_ON": "飞行模式已开启",
         "NUM_SONGS_FOUND": "〖找到 %d 首歌〗",
         "MUSIC_FINISHED": "《～♪ 音乐播放完毕 ♪～》",
+        "MUSIC_PLAYING": "♪ 播放中",
         "MUSIC_STOPPED": "《～音乐播放中断～》",
         "MUSIC_FROM_SD": "SD 卡挂载成功，将播放 SD 卡上的音乐"
     }

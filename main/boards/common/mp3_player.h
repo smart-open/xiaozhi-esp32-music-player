@@ -45,6 +45,8 @@ public: //Misic override
 
 public: // HttpMp3Player 方法
     bool QueryAndPlay(const std::string& song_name, const std::string& artist_name, std::string& query_result);
+    static void SetSubsonicBaseUrl(const std::string& url);
+    static bool ParseStreamUrl(const std::string& url, std::string& base, std::string& song_id);
 
 private:
     MP3Source mp3_source_ = MP3SourceUnknow;
@@ -84,6 +86,7 @@ private:
     bool get_cover_by_coverid_fatfs(const std::string& cover_id, uint8_t** out_buf, size_t* out_size);
 
     void continuous_playing(); //連續播放模式入口
+    static void play_scheduler_task(void* arg);
     static void streaming_task(void* arg);
     bool start_streaming_pipeline();
 

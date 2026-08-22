@@ -57,6 +57,7 @@
         "HELLO_MY_FRIEND": "Hello, my friend!",
         "NUM_SONGS_FOUND": "〖 %d of Songs Found 〗",
         "MUSIC_FINISHED": "《~ ♪ Playback Ended ♪ ~》",
+        "MUSIC_PLAYING": "♪ Playing",
         "MUSIC_STOPPED": "《~ Playback Stopped ~》",
         "MUSIC_FROM_SD": "Will now play mp3 music from SD card."
     }

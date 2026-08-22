@@ -21,7 +21,7 @@
 
 #include "led/single_led.h"
 
-//#include "esp_heap_caps.h"
+#include <esp_heap_caps.h>
 
 #define TAG "Mp3Player"
 #define SD_MOUNT_POINT "/sdcard"
@@ -34,35 +34,53 @@ Mp3Player::Mp3Player(bool support_stereo){
     support_stereo_ = support_stereo;
     play_mode_ = get_play_mode();
     auto& mcp_server = McpServer::GetInstance();
-    mcp_server.AddTool("self.music.play_song",
-            "播放指定的歌曲。当用户要求播放音乐时使用此工具，会自动获取歌曲详情并开始流式播放。\n"
+    mcp_server.AddTool("self.music.play_url",
+            "流式播放指定 URL 的音乐。当 AI 已通过音乐服务工具（music_play / music_search）查询到歌曲的播放地址（url 字段）后，"
+            "调用本工具直接播放该地址，无需再次查询。\n"
             "参数说明:\n"
-            "  `song_name`: 要播放的歌曲名称（可选，默认为空字符串）。\n"
-            "  `artist_name`: 要播放的主唱者或艺术家名称（可选，默认为空字符串）。\n"
-            "使用规则:\n"
-            "  用户未提到明确的主唱、艺术家、歌曲名称，相关栏位以空字串符替代。\n"
+            "  `url`: 音乐的完整播放地址（来自 music_play 工具返回的 song.url 字段，必填）。\n"
+            "  `title`: 歌曲名称（可选，默认为空字符串）。\n"
+            "  `artist`: 歌手名称（可选，默认为空字符串）。\n"
             "返回:\n"
             "  播放状态信息，不需确认。\n"
             "范例:\n"
-            "  '播放五月天的任性'\n"
-            "  '我想听周董的歌'\n"
-            "  '随机挑几首歌来播放'\n", 
+            "  music_play 返回 url 后：'播放该 url'（url='http://192.168.x.x:8000/subsonic/rest/stream.view?...'）\n"
+            "  '随机挑几首歌来播放'（先 music_search/music_play 取得 url 再调用）\n",
         PropertyList({
-                 Property("song_name", kPropertyTypeString),//歌曲名称（必需）
-                 Property("artist_name", kPropertyTypeString, "")//艺术家名称（可选，默认为空字符串）
-        }), 
+                 Property("url", kPropertyTypeString),//播放地址（必需）
+                 Property("title", kPropertyTypeString, ""),//歌曲名称（可选，默认为空字符串）
+                 Property("artist", kPropertyTypeString, "")//歌手名称（可选，默认为空字符串）
+        }),
         [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGW(TAG, "MCP 執行 Http-Mp3-Player ");
-            auto song_name = properties["song_name"].value<std::string>();
-            auto artist_name = properties["artist_name"].value<std::string>();
-            std::string message;
-            if (!this->QueryAndPlay(song_name, artist_name, message)) {
-                return "{\"success\": false, \"message\": \"获取音乐资源失败\"}";
+            ESP_LOGW(TAG, "MCP 執行 play_url");
+            auto url = properties["url"].value<std::string>();
+            if (url.empty()) {
+                return "{\"success\": false, \"message\": \"url 参数不能为空\"}";
             }
-            ESP_LOGI(TAG, "Music details result: %s", message.c_str());
-            return "{\"success\": true, \"message\": \"" +  message + "\"}";
+            auto title = properties["title"].value<std::string>();
+            auto artist = properties["artist"].value<std::string>();
+            ESP_LOGI(TAG, "播放位址 URL: %s", url.c_str());
+            mp3_source_ = MP3SourceHTTP;
+            current_music_info_ = MusicInfo{};
+            current_music_info_.title = title.empty() ? "音樂" : title;
+            current_music_info_.artist = artist;
+            current_music_info_.mp3_url = url;
+            // 從播放 URL 解析伺服器位址與歌曲 id（供歌詞/封面查詢，免燒錄位址）
+            std::string base, song_id;
+            if (ParseStreamUrl(url, base, song_id)) {
+                SetSubsonicBaseUrl(base);
+                current_music_info_.song_id = song_id;
+                current_music_info_.cover_id = song_id;
+                ESP_LOGI(TAG, "解析 URL -> base=%s, song_id=%s", base.c_str(), song_id.c_str());
+            } else {
+                ESP_LOGW(TAG, "非 Subsonic stream URL，略過歌詞查詢");
+            }
+            if (!this->Play()) {
+                return "{\"success\": false, \"message\": \"建立播放任務失敗\"}";
+            }
+            return "{\"success\": true, \"message\": \"開始播放: " + current_music_info_.title + "\"}";
     });
-    ESP_LOGI(TAG, "HttpMp3Player with MCP Tools `self.music.play_song` created.");
+    ESP_LOGI(TAG, "HttpMp3Player with MCP Tools `self.music.play_url` created.");
     //播放模式設定
     mcp_server.AddTool("self.music.set_play_mode",
             "使用此工具设置对应的播放模式，可以选择单曲播放模式(播放一首后停止)或连续播放模式(持续播放不同歌曲)。\n"
@@ -503,39 +521,72 @@ bool Mp3Player::Play()
         ESP_LOGE(TAG, "_current_music_info.mp3_url.empty()");
         return false;
     }
-    /*
-    FreeRTOS 的 Task 用 static streaming_task 進場，
-    C++ 用物件收尾。
-    */    
-    // 啟動 task
-    /*
-    BaseType_t result = xTaskCreate(
-        streaming_task,
-        "STREAM_TASK",
-        8192,
-        this,   // 👈 只傳 this
-        5,
-        nullptr
-    );
-    */
-    // TaskHandle_t task_handle_ = nullptr;
+    /* 語音會話期間內部 RAM 僅剩數 KB（WakeNet+AFE+Opus+MQTT 佔用），
+       直接建立 8KB 播放任務會因記憶體不足而失敗。
+       先建立輕量排程任務（小棧），等語音會話結束、記憶體回升後再建立真正的播放任務。 */
     const BaseType_t core_id = CONFIG_FREERTOS_NUMBER_OF_CORES - 1;
     BaseType_t result = xTaskCreatePinnedToCore(
-        streaming_task,
-        "STREAM_TASK",
-        8192,
+        play_scheduler_task,
+        "PLAY_SCHED",
+        2560,
         this,
-        pipeline_task_prio_, //優先權，0~24，越大越優先，要實際測試過才知道，太大會與 WIFI 搶資源，太小會斷音
-        nullptr, //&task_handle_,
+        pipeline_task_prio_ - 1,
+        nullptr,
         core_id
     );
 
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create streaming task");
+        ESP_LOGE(TAG, "Failed to create play scheduler task, free internal=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return false;
     }
 
     return true; // 立即回傳
+}
+
+void Mp3Player::play_scheduler_task(void* arg)
+{
+    auto* self = static_cast<Mp3Player*>(arg);
+    auto& app = Application::GetInstance();
+
+    // 等待小智說完話（speaking/connecting -> listening）
+    while (app.GetDeviceState() == kDeviceStateSpeaking ||
+           app.GetDeviceState() == kDeviceStateConnecting) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // 強制結束會話（listening -> idle），釋放 AFE / Opus / MQTT 佔用的內部記憶體
+    while (app.GetDeviceState() == kDeviceStateListening) {
+        ESP_LOGI(TAG, "切換至待機狀態，釋放記憶體後開始播放...");
+        app.ToggleChatState();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    // 會話結束後內部記憶體回升，建立播放任務
+    // 歌詞查詢（HTTP+JSON 深呼叫棧）已移至 STREAM_TASK 內執行：
+    // 排程任務僅 2.5KB 棧，先前在 此查歌詞導致 stack overflow、設備重啟
+    const BaseType_t core_id = CONFIG_FREERTOS_NUMBER_OF_CORES - 1;
+    BaseType_t result = pdFAIL;
+    for (int i = 0; i < 10 && result != pdPASS; i++) {
+        result = xTaskCreatePinnedToCore(
+            streaming_task,
+            "STREAM_TASK",
+            10240,
+            self,
+            pipeline_task_prio_, //優先權，0~24，越大越優先，要實際測試過才知道，太大會與 WIFI 搶資源，太小會斷音
+            nullptr,
+            core_id
+        );
+        if (result != pdPASS) {
+            ESP_LOGW(TAG, "STREAM_TASK 建立失敗（free internal=%u），等待重試...",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create streaming task after retries");
+    }
+    vTaskDelete(nullptr);
 }
 
 void Mp3Player::streaming_task(void* arg)
@@ -543,6 +594,16 @@ void Mp3Player::streaming_task(void* arg)
     auto* self = static_cast<Mp3Player*>(arg);
 
     vTaskDelay(pdMS_TO_TICKS(300));
+
+    // 會話已結束、內部記憶體回升：在此查詢歌詞（HTTP+JSON 需要較深呼叫棧，
+    // 10KB 棧足夠；查詢完成後棧幀釋放，不影響後續串流管線的棧用量）
+    if (!self->current_music_info_.song_id.empty()) {
+        if (!self->get_song_lyrics(self->current_music_info_.song_id)) {
+            ESP_LOGW(TAG, "【%s】沒有歌詞!", self->current_music_info_.title.c_str());
+        } else {
+            ESP_LOGI(TAG, "已載入歌詞 %d 行", (int)self->current_music_info_.lyrics.size());
+        }
+    }
 
     self->start_streaming_pipeline();
 
@@ -601,6 +662,14 @@ bool Mp3Player::start_streaming_pipeline(){
     if(led){
         led->SetColor(0,DEFAULT_BRIGHTNESS,DEFAULT_BRIGHTNESS);
         led->TurnOn();
+    }
+
+    //裝置已待命（會話記憶體已釋放供播放管線使用）：狀態欄改顯示「播放中」，避免使用者誤認為停止播放
+    {
+        auto status_display = Board::GetInstance().GetDisplay();
+        app.Schedule([status_display]() {
+            status_display->SetStatus(Lang::Strings::MUSIC_PLAYING);
+        });
     }
 
 #ifdef CONFIG_SPIRAM
@@ -735,6 +804,12 @@ bool Mp3Player::start_streaming_pipeline(){
     //預緩存機制
     bool buffer_enabled = true; //是否啟用預緩存
 
+    //診斷統計：追蹤 PCM 讀取與 I2S 寫入（排查無聲問題）
+    size_t diag_bytes_read = 0;        // raw_stream_read 累計位元組
+    size_t diag_samples_written = 0;   // 送入 codec 的累計樣本
+    bool diag_first_block = true;      // 首塊 PCM 采样打印
+    TickType_t diag_last_beat = xTaskGetTickCount();
+
     ESP_LOGI(TAG, "[ 4 ] Start audio_pipeline");
     audio_pipeline_run(pipeline);
 
@@ -822,6 +897,13 @@ bool Mp3Player::start_streaming_pipeline(){
             // 3. 讀出管線中的 PCM 數據。mp3_decoder 已經幫忙處理成 PCM 數據，
             int read_len = raw_stream_read(raw_stream_reader, reinterpret_cast<char *>(pcm_buf), PCM_BYTES);
             if (read_len > 0) {
+                diag_bytes_read += read_len;
+                if (diag_first_block) {
+                    diag_first_block = false;
+                    ESP_LOGW(TAG, "首塊PCM: len=%d 樣本=[%d %d %d %d] %s",
+                             read_len, pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3],
+                             (pcm_buf[0] == 0 && pcm_buf[1] == 0) ? "⚠️全零=靜音數據" : "✓非零");
+                }
                 size_t num_samples = read_len / sizeof(int16_t); // 總樣本數
                 size_t frames = num_samples / channels; //總 frame 數，計算歌詞用
                 //size_t channels = music_info.channels;          // mp3 decoder 的 channel 數
@@ -869,6 +951,18 @@ bool Mp3Player::start_streaming_pipeline(){
 
                 // 送給 codec
                 codec->OutputData(pcm_data);
+                diag_samples_written += num_samples;
+
+                // 15 秒心跳：確認播放循環活著、PCM 持續寫入 I2S
+                TickType_t now = xTaskGetTickCount();
+                if (now - diag_last_beat >= pdMS_TO_TICKS(15000)) {
+                    diag_last_beat = now;
+                    uint32_t played_s = (uint32_t)((uint64_t)total_frames_played * 1000 / sample_rates / 1000);
+                    ESP_LOGW(TAG, "♪心跳: 已播%us 已讀%uKB 已寫I2S %u樣本(約%us@%dHz) 歌詞%u/%u",
+                             played_s, (unsigned)(diag_bytes_read / 1024), (unsigned)diag_samples_written,
+                             (unsigned)((uint64_t)diag_samples_written / sample_rates), sample_rates,
+                             (unsigned)current_lyric_index, (unsigned)current_music_info_.lyrics.size());
+                }
             }
 
         } catch(const std::exception &e) {
@@ -879,6 +973,11 @@ bool Mp3Player::start_streaming_pipeline(){
     }
 
     ESP_LOGI(TAG, "[ 5 ] Stop audio_pipeline");
+    //播放結束診斷統計：判斷 PCM 是否真的送達 I2S
+    ESP_LOGW(TAG, "播放統計: 讀取%uKB PCM, 寫入I2S %u樣本(約%us@%dHz), 完整播放=%s",
+             (unsigned)(diag_bytes_read / 1024), (unsigned)diag_samples_written,
+             (unsigned)((uint64_t)diag_samples_written / (sample_rates ? sample_rates : 1)),
+             sample_rates, complete_played ? "是" : "否");
     audio_pipeline_stop(pipeline);
     audio_pipeline_wait_for_stop(pipeline);
     //vTaskDelay(pdMS_TO_TICKS(30));  // ⭐ 再等一下確保 element task 真正退出，播免後續資源清除不乾淨，例如監聽物件仍在作用，導致崩潰錯誤
@@ -904,6 +1003,13 @@ bool Mp3Player::start_streaming_pipeline(){
     codec->ResetOutputSampleRate(); //恢復原來的設定
 
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); //恢復待機時 WIFI 低功耗
+
+    //播放結束：裝置若仍在待命（未開新會話），狀態欄恢復「待命」；若已開新會話則由狀態機自動覆蓋
+    app.Schedule([&app, display]() {
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            display->SetStatus(Lang::Strings::STANDBY);
+        }
+    });
 
     //當完整播完歌，且為連續播放模式時保留 current_music_info_ 用來判定下一首不要重複，否則清空
     if(!(complete_played && play_mode_ == PlayModeContinuous)){
